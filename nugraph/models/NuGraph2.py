@@ -287,7 +287,7 @@ class NuGraph2(LightningModule):
                 # int += torch.sum(graph[p].x_raw[true_mich_idxs, 2])
                 # if int != 0: print(f'Edep: {int * 0.00580717}')
 
-        total_loss += michel_reg_loss
+            total_loss += michel_reg_loss
 
         return total_loss, total_metrics
 
