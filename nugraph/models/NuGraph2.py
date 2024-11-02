@@ -35,13 +35,12 @@ class NuGraph2(LightningModule):
                  semantic_head: bool = True, # Base decoder that classifies hits according to semantic_classes
                  filter_head: bool = True, # Decoder that filters hits not related to the primary interaction (detector noise and cosmic rays)
                  vertex_head: bool = False, # Decoder to identify the 3D space point of the primary neutrino interaction
-                 michel_head: bool = False,
                  count_head: bool = False,
                  checkpoint: bool = False,
                  michelenergy_reg: bool = True,
-                 reg_type: str = 'data',
+                 reg_type: str = 'landau',
                  michel_reg_cte: float = 1e-2,
-                 lr: float = 0.001):
+                 lr: float = 0.0005):
         super().__init__()
 
         warnings.filterwarnings("ignore", ".*NaN values found in confusion matrix.*")
@@ -105,14 +104,6 @@ class NuGraph2(LightningModule):
                 planes,
                 semantic_classes)
             self.decoders.append(self.vertex_decoder)
-
-        if michel_head:
-            self.michel_decoder = MichelDecoder(
-                planar_features,
-                planes,
-                3
-            )
-            self.decoders.append(self.michel_decoder)
 
         if count_head:
             self.count_decoder = CountDecoder(
@@ -248,9 +239,12 @@ class NuGraph2(LightningModule):
             michel_reg_loss = 0.0
 
             # Hyperparams to tune
-            edep_lim = 160
+            edep_lim_high = 160
+            edep_lim_low = 1
             pdf_amp = 10
 
+            # print(batch)
+            
             for graph in batch.to_data_list():
                 edep_michel = 0.0
                 for p in self.planes:
@@ -271,9 +265,11 @@ class NuGraph2(LightningModule):
                 if edep_michel > 0:
                     # Adding a penalty to the loss based on the predicted deposited energy and its expected value
                     if self.reg_type == 'cutoff':  # hard cutoff for very high deposited energies
-                        if edep_michel > edep_lim:
-                            michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim) / 15
-
+                        # if edep_michel > edep_lim_high:
+                        #     michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_high) / 15
+                        if edep_michel < edep_lim_low:
+                            michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_low) / 10
+                            
                     elif self.reg_type == 'landau' and edep_michel > 8.5:  # single peak distribution
                         pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='landau')
                         michel_reg_loss += self.michel_reg_cte * (1 - pdf_amp * pdf_value)
