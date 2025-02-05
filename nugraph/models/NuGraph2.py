@@ -15,26 +15,33 @@ from .nexus import NexusNet
 from .decoders import SemanticDecoder, FilterDecoder, EventDecoder, VertexDecoder, MichelDecoder, CountDecoder
 from ..util import MichelDistribution
 
+
 class NuGraph2(LightningModule):
     """PyTorch Lightning module for model training.
 
     Wrap the base model in a LightningModule wrapper to handle training and
     inference, and compute training metrics."""
+
     def __init__(self,
-                 in_features: int = 4, # Are the 4 hit features: [WireID, PeakTime, Integral, RMS] in that order
-                 planar_features: int = 128, # These 4 features are encoded into a (planar_features) vector through encoder.py
-                 nexus_features: int = 32, # Number of features of the nexus nodes
+                 in_features: int = 4,  # Are the 4 hit features: [WireID, PeakTime, Integral, RMS] in that order
+                 planar_features: int = 128,
+                 # These 4 features are encoded into a (planar_features) vector through encoder.py
+                 nexus_features: int = 32,  # Number of features of the nexus nodes
                  vertex_aggr: str = 'lstm',
                  vertex_lstm_features: int = 64,
-                 vertex_mlp_features: list[int] = [ 64 ],
-                 planes: list[str] = ['u','v','y'], # Name of each plane
-                 semantic_classes: list[str] = ['MIP','HIP','shower','michel','diffuse'], # Possible classes of each node for semantic head
-                 event_classes: list[str] = ['numu','nue','nc'], # Possible events for event head
-                 num_iters: int = 5, # Number of message passing rounds, i.e. layers in the GNN
-                 event_head: bool = False, # Decoder that classifies events according to event_classes. An event is all 3 graphs, one for each plane
-                 semantic_head: bool = True, # Base decoder that classifies hits according to semantic_classes
-                 filter_head: bool = True, # Decoder that filters hits not related to the primary interaction (detector noise and cosmic rays)
-                 vertex_head: bool = False, # Decoder to identify the 3D space point of the primary neutrino interaction
+                 vertex_mlp_features: list[int] = [64],
+                 planes: list[str] = ['u', 'v', 'y'],  # Name of each plane
+                 semantic_classes: list[str] = ['MIP', 'HIP', 'shower', 'michel', 'diffuse'],
+                 # Possible classes of each node for semantic head
+                 event_classes: list[str] = ['numu', 'nue', 'nc'],  # Possible events for event head
+                 num_iters: int = 5,  # Number of message passing rounds, i.e. layers in the GNN
+                 event_head: bool = False,
+                 # Decoder that classifies events according to event_classes. An event is all 3 graphs, one for each plane
+                 semantic_head: bool = True,  # Base decoder that classifies hits according to semantic_classes
+                 filter_head: bool = True,
+                 # Decoder that filters hits not related to the primary interaction (detector noise and cosmic rays)
+                 vertex_head: bool = False,
+                 # Decoder to identify the 3D space point of the primary neutrino interaction
                  count_head: bool = False,
                  checkpoint: bool = False,
                  michelenergy_reg: bool = True,
@@ -60,7 +67,7 @@ class NuGraph2(LightningModule):
         self.encoder = Encoder(in_features,
                                planar_features,
                                planes,
-                              )
+                               )
 
         self.plane_net = PlaneNet(in_features,
                                   planar_features,
@@ -94,7 +101,7 @@ class NuGraph2(LightningModule):
                 planes,
             )
             self.decoders.append(self.filter_decoder)
-            
+
         if vertex_head:
             self.vertex_decoder = VertexDecoder(
                 planar_features,
@@ -109,24 +116,23 @@ class NuGraph2(LightningModule):
             self.count_decoder = CountDecoder(
                 planar_features,
                 planes,
-                semantic_classes # assuming this is the column idx of michel in a tensor (nodes, in_features)
+                semantic_classes  # assuming this is the column idx of michel in a tensor (nodes, in_features)
             )
             self.decoders.append(self.count_decoder)
 
         if len(self.decoders) == 0:
             raise Exception('At least one decoder head must be enabled!')
 
-
     def forward(self,
-                x: dict[str, Tensor], # {plane: node_feature_matrix}, tensor of shape (n_nodes, in_features)
-                edge_index_plane: dict[str, Tensor], # {plane: edge_index_matrix}, tensor of shape (2, n_edges)
+                x: dict[str, Tensor],  # {plane: node_feature_matrix}, tensor of shape (n_nodes, in_features)
+                edge_index_plane: dict[str, Tensor],  # {plane: edge_index_matrix}, tensor of shape (2, n_edges)
                 edge_index_nexus: dict[str, Tensor],
                 nexus: Tensor,
-                batch: dict[str, Tensor] # {plane: batch_vector}, identifies the graph each node in the batch belong to
+                batch: dict[str, Tensor]  # {plane: batch_vector}, identifies the graph each node in the batch belong to
                 ) -> dict[str, Tensor]:
-                # Batch keeps track of which graph in the batch each node belongs to. For the semantic and filter
-                # decoders 'batch' is not used because they operate on the node level, but for the event and vertex
-                # decoders that operate on a graph level 'batch' is used to correctly assign nodes to their graphs.
+        # Batch keeps track of which graph in the batch each node belongs to. For the semantic and filter
+        # decoders 'batch' is not used because they operate on the node level, but for the event and vertex
+        # decoders that operate on a graph level 'batch' is used to correctly assign nodes to their graphs.
 
         # Note that neutrino interaction event is described here as the union of three disjoint graphs, one for
         # each plane. The nodes represent detector hits (i.e. ionized electrons hiting that plane) and the node
@@ -139,7 +145,7 @@ class NuGraph2(LightningModule):
         m = self.encoder(x)  # Calling the forward method of Encoder class
         # 'm' is a dict {'plane_key': (n_nodes, planar_features)}
 
-        for _ in range(self.num_iters): # Number of layers in the GNN (i.e. MP rounds).
+        for _ in range(self.num_iters):  # Number of layers in the GNN (i.e. MP rounds).
             # shortcut connect features
             for p in self.planes:
                 # At each MP round expand the node embedding m[p] by adding the original "raw" node features x[p].
@@ -158,12 +164,12 @@ class NuGraph2(LightningModule):
 
         ret = {}
         for decoder in self.decoders:
-            ret.update(decoder(m, batch)) # semantic and filter decoders don't use batch in their forward method.
+            ret.update(decoder(m, batch))  # semantic and filter decoders don't use batch in their forward method.
 
         return ret
 
-
-    def step(self, data: HeteroData | Batch, # HeteroData because nodes of different planes are considered different types
+    def step(self, data: HeteroData | Batch,
+             # HeteroData because nodes of different planes are considered different types
              stage: str = None,
              confusion: bool = False):
 
@@ -171,26 +177,27 @@ class NuGraph2(LightningModule):
         if isinstance(data, Batch):
             batch = data
         else:
-            batch = Batch.from_data_list([data]) # construct
+            batch = Batch.from_data_list([data])  # construct
 
         # Unpack tensors to call forward method. 'x' is the output of the forward method, and it is a dict of dicts
         # {{decoder1: {plane: pred}}, {decoder2: {plane: pred}}} where 'pred' is a tensor (n_nodes, n_classes_attr)
         # returned by the forward method of the particular decoder
-        x = self(batch.collect('x'), # returns the node feature matrix 'x' of each plane {'u': u_node_feat_matrix, ... }
-                 { p: batch[p, 'plane', p].edge_index for p in self.planes },
-                 { p: batch[p, 'nexus', 'sp'].edge_index for p in self.planes },
+        x = self(batch.collect('x'),
+                 # returns the node feature matrix 'x' of each plane {'u': u_node_feat_matrix, ... }
+                 {p: batch[p, 'plane', p].edge_index for p in self.planes},
+                 {p: batch[p, 'nexus', 'sp'].edge_index for p in self.planes},
                  torch.empty(batch['sp'].num_nodes, 0),
-                 { p: batch[p].batch for p in self.planes })
+                 {p: batch[p].batch for p in self.planes})
         # All args besides the tensor torch.empty(batch['sp'].num_nodes, 0) are dicts {plane: tensor}.
 
         # Update the data input object with the decoder output tensors
         if isinstance(data, Batch):
-            dlist = [ HeteroData() for _ in range(data.num_graphs) ] # create an HeteroData object for each graph
-            for attr, planes in x.items(): # x = {decoder_name: {u: tensor, v: tensor, y: tensor}, ...} is the output of forward()
-                for p, t in planes.items(): # iterate to get a plane and a tensor
+            dlist = [HeteroData() for _ in range(data.num_graphs)]  # create an HeteroData object for each graph
+            for attr, planes in x.items():  # x = {decoder_name: {u: tensor, v: tensor, y: tensor}, ...} is the output of forward()
+                for p, t in planes.items():  # iterate to get a plane and a tensor
                     if t.size(0) == data[p].num_nodes:
                         tlist = unbatch(t, data[p].batch)
-                    elif t.size(0) == data.num_graphs: # data.num_graph is same as data.batch_size
+                    elif t.size(0) == data.num_graphs:  # data.num_graph is same as data.batch_size
                         tlist = unbatch(t, torch.arange(data.num_graphs))
                     else:
                         raise Exception(f'don\'t know how to unbatch attribute {attr}')
@@ -203,7 +210,7 @@ class NuGraph2(LightningModule):
                     for it_d, it_t in zip(dlist, tlist):
                         # For each HeteroData object in dlist, do HeteroDataObj[plane][decoder_name] = decoder_out_tensor,
                         # which creates an entry 'plane={decoder_name: decoder_out_tensor}' in the HeteroData object.
-                        it_d[p][attr] = it_t # same as it_d[p].attr = it_t
+                        it_d[p][attr] = it_t  # same as it_d[p].attr = it_t
                     # The decoder output is {attr: {plane: tensor}} but we change its format to {plane: {attr: tensor}}
 
             tmp = Batch.from_data_list(dlist)
@@ -237,46 +244,38 @@ class NuGraph2(LightningModule):
         # use `edep`, we can use the regularization with the integral directly since they are related by a constant.
         if self.michelenergy_reg:
             michel_reg_loss = 0.0
+            edep_michel = 0.0
 
             # Hyperparams to tune
             edep_lim_high = 160
             edep_lim_low = 1
             pdf_amp = 10
 
-            # print(batch)
-            
-            for graph in batch.to_data_list():
-                edep_michel = 0.0
-                for p in self.planes:
-                    # Finding the predicted labels
-                    y_pred = torch.argmax(graph[p].x_semantic, dim=1)
+            for p in self.planes:
+                # Extract predicted labels across all graphs in the batch
+                y_pred = torch.argmax(batch[p].x_semantic, dim=1)
 
-                    # Finding the indices of the entries that truly correspond to michel electrons
-                    michel_idxs = torch.nonzero(y_pred == self.michel_id)
+                # Extract integral feature for nodes classified as Michel electrons
+                sumintegral_michel = torch.sum(batch[p].x_raw[y_pred == self.michel_id, 2])  # integral is feature index 2
 
-                    # If we predict a michel electron then find its deposited energy
-                    if self.michel_id in y_pred:
-                        # Getting the `integral` feature of the nodes that the semantic decoder labeled as michel
-                        sumintegral_michel = torch.sum(graph[p].x_raw[michel_idxs, 2])  # Integral is the third feature
-
-                        # Finding the deposited energy from that `integral`
-                        edep_michel += sumintegral_michel * 0.00580717
+                # Compute deposited energy for the batch (normalized per graph)
+                edep_michel += (sumintegral_michel * 0.00580717 / batch.num_graphs)
 
                 if edep_michel > 0:
                     # Adding a penalty to the loss based on the predicted deposited energy and its expected value
-                    if self.reg_type == 'cutoff':  # hard cutoff for very high deposited energies
-                        # if edep_michel > edep_lim_high:
-                        #     michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_high) / 15
+                    if self.reg_type == 'cutoff':  # hard cutoff for very high/low deposited energies
+                        if edep_michel > edep_lim_high:
+                            michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_high) / 15
                         if edep_michel < edep_lim_low:
                             michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_low) / 10
-                            
+
                     elif self.reg_type == 'landau' and edep_michel > 8.5:  # single peak distribution
                         pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='landau')
-                        michel_reg_loss += self.michel_reg_cte * (1 - pdf_amp * pdf_value)
+                        michel_reg_loss += self.michel_reg_cte * (1 - pdf_value) * pdf_amp
 
                     elif self.reg_type == 'data':  # purely from data, double peaked distribution
                         pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='data')
-                        michel_reg_loss += self.michel_reg_cte * (1 - pdf_amp * pdf_value)
+                        michel_reg_loss += self.michel_reg_cte * (1 - pdf_value) * pdf_amp
 
                 # # Extracting the true deposited energies
                 # true_mich_idxs = torch.nonzero(graph[p].y_semantic == self.michel_id)
@@ -287,19 +286,18 @@ class NuGraph2(LightningModule):
 
         return total_loss, total_metrics
 
-
     def on_train_start(self):
-        hpmetrics = { 'max_lr': self.hparams.lr }
+        hpmetrics = {'max_lr': self.hparams.lr}
         self.logger.log_hyperparams(self.hparams, metrics=hpmetrics)
         self.max_mem_cpu = 0.
         self.max_mem_gpu = 0.
 
         scalars = {
-            'loss': {'loss': [ 'Multiline', [ 'loss/train', 'loss/val' ]]},
+            'loss': {'loss': ['Multiline', ['loss/train', 'loss/val']]},
             'acc': {}
         }
         for c in self.semantic_classes:
-            scalars['acc'][c] = [ 'Multiline', [
+            scalars['acc'][c] = ['Multiline', [
                 f'semantic_accuracy_class_train/{c}',
                 f'semantic_accuracy_class_val/{c}'
             ]]
@@ -349,9 +347,9 @@ class NuGraph2(LightningModule):
         optimizer = AdamW(self.parameters(),
                           lr=self.lr)
         onecycle = OneCycleLR(
-                optimizer,
-                max_lr=self.lr,
-                total_steps=self.trainer.estimated_stepping_batches)
+            optimizer,
+            max_lr=self.lr,
+            total_steps=self.trainer.estimated_stepping_batches)
         return [optimizer], {'scheduler': onecycle, 'interval': 'step'}
 
     def log_memory(self, batch: Batch, stage: str) -> None:
