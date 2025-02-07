@@ -32,7 +32,7 @@ class FeatureExtension(BaseTransform):
 
             ## Adding node degree
             nodes_degree = torch.unique(data[p, 'plane', p].edge_index[0], sorted=True, return_counts=True)[1].view(-1,1)
-            # nodes_degree = log(nodes_degree) # Should I use log(nodes_degree) instead?
+            nodes_degree = log(nodes_degree) # Should I use log(nodes_degree) instead?
 
 
             ## Adding shortest edge length
