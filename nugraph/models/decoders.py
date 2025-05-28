@@ -5,19 +5,23 @@ from abc import ABC
 import torch
 from torch import Tensor, tensor, cat
 import torch.nn as nn
-from torch_geometric.nn.aggr import SoftmaxAggregation, LSTMAggregation, SumAggregation, MeanAggregation, MaxAggregation, MinAggregation
+import torch.nn.functional as F
+from torch_geometric.nn.aggr import SoftmaxAggregation, LSTMAggregation, SumAggregation, MeanAggregation, \
+    MaxAggregation, MinAggregation
 from torch_geometric.nn.resolver import aggregation_resolver as aggr_resolver
-
+from torch_geometric.nn import GlobalAttention
 import torchmetrics as tm
 
 import matplotlib.pyplot as plt
 import seaborn as sn
 
-from ..util import RecallLoss, LogCoshLoss, ObjCondensationLoss, MichelLoss
+from ..util import RecallLoss, LogCoshLoss, ObjCondensationLoss, MichelLoss, KLDivergenceLoss, \
+    CrossEntropyDistributionLoss, BalancedFocalRecallLoss
 
 
 class DecoderBase(nn.Module, ABC):
     '''Base class for all NuGraph decoders'''
+
     def __init__(self,
                  name: str,
                  planes: list[str],
@@ -43,8 +47,8 @@ class DecoderBase(nn.Module, ABC):
         raise NotImplementedError
 
     def loss(self,
-             batch, # batch of graphs
-             stage: str, # Network stage 'train' or 'test'
+             batch,  # batch of graphs
+             stage: str,  # Network stage 'train' or 'test'
              confusion: bool = False):
         x, y = self.arrange(batch)
         w = self.weight * (-1 * self.temp).exp()
@@ -67,7 +71,7 @@ class DecoderBase(nn.Module, ABC):
     def draw_confusion_matrix(self, cm: tm.ConfusionMatrix) -> plt.Figure:
         '''Produce confusion matrix at end of epoch'''
         confusion = cm.compute().cpu()
-        fig = plt.figure(figsize=[8,6])
+        fig = plt.figure(figsize=[8, 6])
         sn.heatmap(confusion,
                    xticklabels=self.classes,
                    yticklabels=self.classes,
@@ -92,21 +96,33 @@ class DecoderBase(nn.Module, ABC):
             cm.reset()
 
 
+class LogitBias(nn.Module):
+    """Adds a learnable bias to each class logit"""
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(num_classes))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.bias
+
+
 class SemanticDecoder(DecoderBase):
     """NuGraph semantic decoder module.
 
     Convolve down to a single node score per semantic class for each 2D graph,
     node, and remove intermediate node stores from data object.
     """
+
     def __init__(self,
                  node_features: int,
                  planes: list[str],
                  semantic_classes: list[str]):
-        super().__init__('semantic', # decoder name
-                         planes, # planes
-                         semantic_classes, # classes
-                         RecallLoss(), # loss function
-                         weight=2.) # decoder weight
+        super().__init__('semantic',  # decoder name
+                         planes,  # planes
+                         semantic_classes,  # classes
+                         RecallLoss(),  # loss function # BalancedFocalRecallLoss()
+                         weight=2.)  # decoder weight
 
         # torchmetrics arguments
         metric_args = {
@@ -124,13 +140,13 @@ class SemanticDecoder(DecoderBase):
 
         self.net = nn.ModuleDict()
         for p in planes:
-            self.net[p] = nn.Linear(node_features, len(semantic_classes)) # "Score" of each semantic class
+            self.net[p] = nn.Linear(node_features, len(semantic_classes))  # "Score" of each semantic class
 
     def forward(self, x: dict[str, Tensor],
                 batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
         # Note that each plane has its own semantic labeling. Usually the labeling is consistent across planes, but
         # there are cases where the same hit is labeled differently in different planes.
-        return { 'x_semantic': { p: self.net[p](x[p]) for p in self.planes } }
+        return {'x_semantic': {p: self.net[p](x[p]) for p in self.planes}}
 
     def arrange(self, batch) -> tuple[Tensor, Tensor]:
         # Concatenates each plane graph into a single big graph
@@ -149,88 +165,80 @@ class SemanticDecoder(DecoderBase):
             batch[p].x_semantic = batch[p].x_semantic.softmax(dim=1)
 
 
-class MichelDecoder(DecoderBase):
+class MichelBinaryDecoder(DecoderBase):
     """
-    Asserts if the energy distribution (integral label) of michel electron hits follows the expected physics?
+    Per-node auxiliary classifier: for each hit, predict Michel (1) vs not-Michel (0).
 
-    As a low-hanging fruit, I will first compare the number of hits labeled as michel electron instead of the number of
-    michel electrons itself (a single michel electron produces many hits). Thus, in this case the loss function will
-    compare predicted percentage of michel electrons hits with the true number of michel electrons hits.
+    Uses BCEWithLogitsLoss (so targets are 0/1, predictions are raw logits).
     """
+
     def __init__(self,
                  node_features: int,
                  planes: list[str],
-                 michel_id: int
-                 ):
+                 michel_idx: int):
+        super().__init__('michel_bin',
+                         planes,
+                         ['not_michel', 'michel'],
+                         nn.BCEWithLogitsLoss(),
+                         weight=1.0)
 
-        super().__init__('michel', # decoder name
-                         planes, # planes
-                         ('michel', 'not_michel'), # classes
-                         nn.L1Loss(reduction='mean'), # loss function
-                         weight=2.) # decoder weight
+        self.michel_idx = michel_idx
 
+        self.net = nn.ModuleDict({
+            p: nn.Linear(node_features, 1) for p in planes
+        })
 
-        self.michel_id = michel_id
-        self.mse = tm.MeanSquaredError()
-        self.mae = tm.MeanAbsoluteError()
+        metric_args = {'task': 'binary'}
+        self.recall = tm.Recall(**metric_args)
+        self.precision = tm.Precision(**metric_args)
+        self.ap = tm.AveragePrecision(**metric_args)
+        self.confusion['recall_michel_matrix'] = tm.ConfusionMatrix(
+            normalize='true', **metric_args)
+        self.confusion['precision_michel_matrix'] = tm.ConfusionMatrix(
+            normalize='pred', **metric_args)
 
-        self.pool = SumAggregation() # don't need to use a pool for each plane because its a simply sum aggr
-        self.net = nn.ModuleDict() # self.net here is a readout function
-        for p in planes:
-            self.net[p] = nn.Sequential(
-                nn.Linear(node_features, 1),
-                nn.Sigmoid()
-            )
-        # Deeper the MLP in the decoder is, more it can learn through adjusting its own parameters instead of adjusting
-        # the parameters before the decoder heads. Thus, a deeper decoder MLP means less "interaction" between decoders.
-
-    # Outputs the percentage of michel electrons hits on each plane
     def forward(self, x: dict[str, Tensor],
                 batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
-        return { 'x_michel': { p: self.net[p]( self.pool(x[p], batch[p]) ) for p in self.planes } }
+        return {'x_michel_bin': {p: self.net[p](x[p]).squeeze(-1) for p in self.planes}}
 
-    # I think I'll have to open that batch and extract them. In this case 'x' would be shape (n_graphs, 3) and 'y'
-    # (n_graphs, 1) where 'n_graphs' are the number of graphs in the batch.
     def arrange(self, batch) -> tuple[Tensor, Tensor]:
-        # x = cat([batch[p].x_michel for p in self.planes], dim=0) # Each event graph yield a shape (3,) vector, one for each plane
+        preds, targets = [], []
+        for p in self.planes:
+            preds.append(batch[p].x_michel_bin)
 
-        ## Must unbatch the 'y' tensor as {'u': tensor_list, 'v': tensor_list, 'y': tensor_list} using batch._slice_dict
-        ## to obtain the total number of michel hits of each graph.
-        x = torch.empty(batch.num_graphs, len(self.planes))
-        y = torch.empty(batch.num_graphs, len(self.planes))
-        for i, graph in enumerate(batch.to_data_list()):
-            planes_semantic = graph.collect('y_semantic')
-            planes_count = graph.collect('x_michel')
-            for j, p in enumerate(self.planes):
-                y[i,j] = torch.count_nonzero(planes_semantic[p] == self.michel_id) / planes_semantic[p].size(0)
-                x[i,j] = planes_count[p]
-        y = y.flatten(-2,-1)
-        x = x.flatten(-2,-1)
-
-        return x, y
+            # 1 for Michel, 0 otherwise; ignore nodes with y=-1
+            mask = (batch[p].y_semantic != -1)
+            label = (batch[p].y_semantic == self.michel_idx).float()
+            targets.append(label * mask.float())
+        return cat(preds, dim=0), cat(targets, dim=0)
 
     def metrics(self, x: Tensor, y: Tensor, stage: str) -> dict[str, Any]:
+        # x is logits; convert to probabilities for metrics
+        probs = x.sigmoid()
         return {
-            f'MSE_michel/{stage}': self.mse(x, y),
-            f'MAE_michel/{stage}': self.mae(x, y)
+            f'recall_michel_bin/{stage}': self.recall(probs, y),
+            f'precision_michel_bin/{stage}': self.precision(probs, y),
+            f'AP_michel/{stage}': self.ap(probs, y)
         }
+
 
 class CountDecoder(DecoderBase):
     """
     Train the decoder to predict the percentage of each labeled class
 
     """
+
     def __init__(self,
                  node_features: int,
                  planes: list[str],
                  semantic_classes: list[str]
                  ):
 
-        super().__init__('count', # decoder name
-                         planes, # planes
-                         semantic_classes, # classes
-                         nn.L1Loss(reduction='mean'), # loss function
-                         weight=1.) # decoder weight
+        super().__init__('count',  # decoder name
+                         planes,  # planes
+                         semantic_classes,  # classes
+                         nn.MSELoss(),  # loss function
+                         weight=0.001)  # decoder weight
 
         self.semantic_classes = semantic_classes
         self.mse = tm.MeanSquaredError()
@@ -241,53 +249,97 @@ class CountDecoder(DecoderBase):
         self.pool_mean = MeanAggregation()
         self.pool_min = MinAggregation()
         self.pool_max = MaxAggregation()
+
+        ## Plane-specific attention 2 layers
+        # self.pool_attention = nn.ModuleDict({ p: GlobalAttention(nn.Sequential(nn.Linear(node_features, 64),
+        #                                                                        nn.ReLU(),
+        #                                                                        nn.Linear(64, 1)))
+        #                                      for p in planes})
+
+        ## Shared attention 2 layers
+        # self.pool_attention = GlobalAttention(nn.Sequential(nn.Linear(node_features, 16),
+        #                                                     nn.ReLU(),
+        #                                                     nn.Linear(16, 1)
+        #                                                 ))
+
+        ## Shared attention 1 layer
+        self.pool_attention = GlobalAttention(nn.Sequential(nn.Linear(node_features, 1)))
+
         self.net = nn.ModuleDict()
+
+        # for p in planes:
+        #     self.net[p] = nn.Sequential(
+        #         nn.Linear(2*node_features, 16),
+        #         nn.ReLU(),
+        #         nn.Linear(16, len(semantic_classes)),
+        #         nn.Softmax(dim=-1)
+        #     )
+
         for p in planes:
             self.net[p] = nn.Sequential(
-                # nn.Linear(4*node_features, node_features),
-                nn.Linear(4*node_features, len(semantic_classes)),
-                nn.Softmax() # softmax to predict directly the percentages
+                nn.Linear(2 * node_features, len(semantic_classes)),
+                nn.Softmax(dim=-1)
             )
+
         # Deeper the MLP in the decoder is, more it can learn through adjusting its own parameters instead of adjusting
         # the parameters before the decoder heads. Thus, a deeper decoder MLP means less "interaction" between decoders.
 
     def forward(self, x: dict[str, Tensor],
                 batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
+        ########### per event instead of per plane?????????
         out = {}
-
-        ## Concatenate different pools
         for p in self.planes:
             # The pools return a matrix (n_graphs_in_batch, node_features)
             inp_sum = self.pool_sum(x[p], batch[p])
-            inp_mean = self.pool_mean(x[p], batch[p])
-            inp_min = self.pool_min(x[p], batch[p])
-            inp_max = self.pool_max(x[p], batch[p])
-            # sizes = torch.unique(batch[p], return_counts=True)[1].view(-1,1)
-            inp = cat((inp_sum, inp_mean, inp_min, inp_max), dim=-1)
+            # inp_mean = self.pool_mean(x[p], batch[p])
+            # inp_min = self.pool_min(x[p], batch[p])
+            # inp_max = self.pool_max(x[p], batch[p])
+            inp_attn = self.pool_attention(x[p], batch[p])
+            # graph_sizes = torch.log(torch.unique(batch[p], return_counts=True)[1].view(-1, 1).float())
+            inp = cat((inp_sum, inp_attn), dim=-1)
             out.update({p: self.net[p](inp)})
-
         return {'x_count': out}
-        # return { 'x_count': { p: self.net[p]( self.pool_sum(x[p], batch[p]) ) for p in self.planes } }
 
-    def arrange(self, batch) -> tuple[Tensor, Tensor]:
-        x = torch.zeros(batch.num_graphs, len(self.planes), len(self.semantic_classes))
-        y = torch.zeros(batch.num_graphs, len(self.planes), len(self.semantic_classes))
-        for i, graph in enumerate(batch.to_data_list()):
-            planes_semantic = graph.collect('y_semantic')
-            planes_count = graph.collect('x_count')
-            for j, p in enumerate(self.planes):
-                hits_id = planes_semantic[p][planes_semantic[p] != -1]
-                keys, counts = torch.unique(hits_id, return_counts=True)
-                counts_perc = counts.float() / counts.sum()
-                for idx, k in enumerate(keys):
-                    y[i,j,k] = counts_perc[idx]
-                x[i,j] = planes_count[p]
+    def arrange(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
+        device = batch[self.planes[0]].x_count.device
+        num_graphs = batch.num_graphs
+        num_planes = len(self.planes)
+        num_classes = len(self.semantic_classes)
 
-                print(y[i,j], x[i,j])
-                print(y[i,j] - x[i,j])
+        # Allocate [num_graphs, num_planes, num_classes]
+        x = torch.zeros(num_graphs, num_planes, num_classes, device=device)
+        y = torch.zeros(num_graphs, num_planes, num_classes, device=device)
 
-        y = y.flatten(start_dim=1)
+        for j, p in enumerate(self.planes):
+            # Collect the predicted distribution for plane p, shape => [num_graphs, num_classes]
+            x[:, j, :] = batch[p].x_count
+
+            # Build ground-truth distribution gather the labels for plane p
+            labels = batch[p].y_semantic
+            valid_mask = (labels != -1)
+            labels = labels[valid_mask]
+
+            # which graph each node belongs to
+            g_idx = batch[p].batch[valid_mask]
+
+            # One-hot encode the valid labels => shape [num_valid_nodes, num_classes]
+            one_hot = F.one_hot(labels, num_classes=num_classes).float()
+
+            # Accumulate the sums of one-hot vectors per graph using index_add_, sums => shape [num_graphs, num_classes]
+            sums = torch.zeros(num_graphs, num_classes, device=device)
+            sums.index_add_(0, g_idx, one_hot)
+
+            # Convert sums to fractions-of-total
+            row_sums = sums.sum(dim=1, keepdim=True)
+            row_sums = torch.where(row_sums == 0, torch.tensor(1., device=device),
+                                   row_sums)  # avoid division by zero if no valid node
+            frac = sums / row_sums
+
+            y[:, j, :] = frac
+
+        # Finally, flatten the last two dims => shape [num_graphs, num_planes * num_classes]
         x = x.flatten(start_dim=1)
+        y = y.flatten(start_dim=1)
 
         return x, y
 
@@ -304,15 +356,16 @@ class FilterDecoder(DecoderBase):
     Convolve down to a single node score, to identify and filter out
     graph nodes that are not part of the primary physics interaction
     """
+
     def __init__(self,
                  node_features: int,
                  planes: list[str],
-                ):
-        super().__init__('filter', # decoder name
-                         planes, # planes
-                         ('noise', 'signal'), # classes
-                         nn.BCELoss(), # loss function
-                         weight=2.) # decoder weight
+                 ):
+        super().__init__('filter',  # decoder name
+                         planes,  # planes
+                         ('noise', 'signal'),  # classes
+                         nn.BCELoss(),  # loss function
+                         weight=1.)  # decoder weight
 
         # torchmetrics arguments
         metric_args = {
@@ -335,12 +388,12 @@ class FilterDecoder(DecoderBase):
 
     def forward(self, x: dict[str, Tensor],
                 batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
-        return { 'x_filter': { p: self.net[p](x[p]).squeeze(dim=-1) for p in self.planes }}
+        return {'x_filter': {p: self.net[p](x[p]).squeeze(dim=-1) for p in self.planes}}
 
     def arrange(self, batch) -> tuple[Tensor, Tensor]:
         # Concatenating all planes nodes into a single tensor
         x = cat([batch[p].x_filter for p in self.planes], dim=0)
-        y = cat([(batch[p].y_semantic!=-1).float() for p in self.planes], dim=0) # How is batch[p].y_semantic stored?
+        y = cat([(batch[p].y_semantic != -1).float() for p in self.planes], dim=0)  # How is batch[p].y_semantic stored?
         return x, y
 
     def metrics(self, x: Tensor, y: Tensor, stage: str) -> dict[str, Any]:
@@ -356,6 +409,7 @@ class EventDecoder(DecoderBase):
     Convolve graph node features down to a single classification score
     for the entire event
     '''
+
     def __init__(self,
                  node_features: int,
                  planes: list[str],
@@ -388,8 +442,8 @@ class EventDecoder(DecoderBase):
 
     def forward(self, x: dict[str, Tensor],
                 batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
-        x = [ pool(x[p], batch[p]) for p, pool in self.pool.items() ]
-        return { 'x': { 'evt': self.net(cat(x, dim=1)) }}
+        x = [pool(x[p], batch[p]) for p, pool in self.pool.items()]
+        return {'x': {'evt': self.net(cat(x, dim=1))}}
 
     def arrange(self, batch) -> tuple[Tensor, Tensor]:
         return batch['evt'].x, batch['evt'].y
@@ -407,6 +461,7 @@ class EventDecoder(DecoderBase):
 class VertexDecoder(DecoderBase):
     """
     """
+
     def __init__(self,
                  node_features: int,
                  aggr: str,
@@ -436,17 +491,17 @@ class VertexDecoder(DecoderBase):
 
         # initialise MLP
         net = []
-        feats = [ len(self.planes) * in_features ] + mlp_features + [ 3 ]
+        feats = [len(self.planes) * in_features] + mlp_features + [3]
         for f_in, f_out in zip(feats[:-1], feats[1:]):
             net.append(nn.Linear(in_features=f_in, out_features=f_out))
             net.append(nn.ReLU())
-        del net[-1] # remove last activation function
+        del net[-1]  # remove last activation function
         self.net = nn.Sequential(*net)
 
-    def forward(self, x: dict[str, Tensor], batch: dict[str, Tensor]) -> dict[str,dict[str, Tensor]]:
-        x = [ net(x[p], index=batch[p]) for p, net in self.aggr.items() ]
+    def forward(self, x: dict[str, Tensor], batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
+        x = [net(x[p], index=batch[p]) for p, net in self.aggr.items()]
         x = cat(x, dim=1)
-        return { 'x_vtx': { 'evt': self.net(x) }}
+        return {'x_vtx': {'evt': self.net(x)}}
 
     def arrange(self, batch) -> tuple[Tensor, Tensor]:
         x = batch['evt'].x_vtx
@@ -454,7 +509,7 @@ class VertexDecoder(DecoderBase):
         return x, y
 
     def metrics(self, x: Tensor, y: Tensor, stage: str) -> dict[str, Any]:
-        xyz = (x-y).abs().mean(dim=0)
+        xyz = (x - y).abs().mean(dim=0)
         return {
             f'vertex-resolution-x/{stage}': xyz[0],
             f'vertex-resolution-y/{stage}': xyz[1],
