@@ -224,123 +224,142 @@ class MichelBinaryDecoder(DecoderBase):
 
 class CountDecoder(DecoderBase):
     """
-    Train the decoder to predict the percentage of each labeled class
-
+    Predict, per plane, the distribution (fractions) over semantic classes for each event.
     """
-
-    def __init__(self,
-                 node_features: int,
-                 planes: list[str],
-                 semantic_classes: list[str]
-                 ):
-
-        super().__init__('count',  # decoder name
-                         planes,  # planes
-                         semantic_classes,  # classes
-                         nn.MSELoss(),  # loss function
-                         weight=0.001)  # decoder weight
+    def __init__(
+        self,
+        node_features: int,
+        planes: list[str],
+        semantic_classes: list[str],
+        *,
+        hidden: int = 64,
+        shared_head: bool = True,
+        plane_emb_dim: int = 16,
+        temperature: float = 1.0,
+        label_smoothing: float = 0.0,
+        weight: float = 1e-3,
+    ):
+        super().__init__(
+            'count',     # decoder name
+            planes,            # planes
+            semantic_classes,  # classes
+            nn.MSELoss(),      # keep MSE to avoid breaking training loop
+            weight=weight
+        )
 
         self.semantic_classes = semantic_classes
+        self.num_classes = len(semantic_classes)
+        self.temperature = float(temperature)
+        self.label_smoothing = float(label_smoothing)
+        self.shared_head = bool(shared_head)
+        self.planes = list(planes)
+        self._plane_to_idx = {p: i for i, p in enumerate(self.planes)}
+
         self.mse = tm.MeanSquaredError()
         self.mae = tm.MeanAbsoluteError()
 
-        # don't need to use a different aggregation for each plane because its a simply sum pooling, nothing to "learn"
-        self.pool_sum = SumAggregation()
+        # Poolers
+        self.pool_sum  = SumAggregation()
         self.pool_mean = MeanAggregation()
-        self.pool_min = MinAggregation()
-        self.pool_max = MaxAggregation()
+        self.pool_attn = GlobalAttention(nn.Linear(node_features, 1)) # 1-layer gate
 
-        ## Plane-specific attention 2 layers
-        # self.pool_attention = nn.ModuleDict({ p: GlobalAttention(nn.Sequential(nn.Linear(node_features, 64),
-        #                                                                        nn.ReLU(),
-        #                                                                        nn.Linear(64, 1)))
-        #                                      for p in planes})
+        # Feature dim after pooling: sum(H) + mean(H) + attn(H) + log|V|
+        pooled_dim = 3 * node_features + 1
 
-        ## Shared attention 2 layers
-        # self.pool_attention = GlobalAttention(nn.Sequential(nn.Linear(node_features, 16),
-        #                                                     nn.ReLU(),
-        #                                                     nn.Linear(16, 1)
-        #                                                 ))
-
-        ## Shared attention 1 layer
-        self.pool_attention = GlobalAttention(nn.Sequential(nn.Linear(node_features, 1)))
-
-        self.net = nn.ModuleDict()
-
-        # for p in planes:
-        #     self.net[p] = nn.Sequential(
-        #         nn.Linear(2*node_features, 16),
-        #         nn.ReLU(),
-        #         nn.Linear(16, len(semantic_classes)),
-        #         nn.Softmax(dim=-1)
-        #     )
-
-        for p in planes:
-            self.net[p] = nn.Sequential(
-                nn.Linear(2 * node_features, len(semantic_classes)),
-                nn.Softmax(dim=-1)
+        if self.shared_head:
+            self.plane_emb = nn.Embedding(len(self.planes), plane_emb_dim)
+            in_dim = pooled_dim + plane_emb_dim
+            self.head = nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden, self.num_classes),
             )
+        else:
+            in_dim = pooled_dim
+            self.net = nn.ModuleDict({
+                p: nn.Sequential(
+                    nn.Linear(in_dim, hidden),
+                    nn.LayerNorm(hidden),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(hidden, self.num_classes),
+                ) for p in self.planes
+            })
 
-        # Deeper the MLP in the decoder is, more it can learn through adjusting its own parameters instead of adjusting
-        # the parameters before the decoder heads. Thus, a deeper decoder MLP means less "interaction" between decoders.
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x: dict[str, Tensor],
                 batch: dict[str, Tensor]) -> dict[str, dict[str, Tensor]]:
-        ########### per event instead of per plane?????????
         out = {}
         for p in self.planes:
-            # The pools return a matrix (n_graphs_in_batch, node_features)
-            inp_sum = self.pool_sum(x[p], batch[p])
-            # inp_mean = self.pool_mean(x[p], batch[p])
-            # inp_min = self.pool_min(x[p], batch[p])
-            # inp_max = self.pool_max(x[p], batch[p])
-            inp_attn = self.pool_attention(x[p], batch[p])
-            # graph_sizes = torch.log(torch.unique(batch[p], return_counts=True)[1].view(-1, 1).float())
-            inp = cat((inp_sum, inp_attn), dim=-1)
-            out.update({p: self.net[p](inp)})
+            xs = self.pool_sum(x[p],  batch[p]) # (G, H)
+            xm = self.pool_mean(x[p], batch[p]) # (G, H)
+            xa = self.pool_attn(x[p], batch[p]) # (G, H)
+
+            # log graph size feature to stabilize scale when node counts vary
+            counts = torch.bincount(batch[p], minlength=xs.size(0)).float().unsqueeze(1) # (G,1)
+            log_n  = torch.log(torch.clamp_min(counts, 1.0)) # (G,1)
+
+            h = torch.cat([xs, xm, xa, log_n], dim=-1)# (G, pooled_dim)
+
+            if self.shared_head:
+                j = self._plane_to_idx[p]
+                pe = self.plane_emb.weight[j].unsqueeze(0).expand(h.size(0), -1) # (G, E)
+                logits = self.head(torch.cat([h, pe], dim=-1))  # (G, C)
+            else:
+                logits = self.net[p](h) # (G, C)
+
+            out[p] = self.softmax(logits / self.temperature)
+
         return {'x_count': out}
+
+    @torch.no_grad()
+    def _counts_per_graph(self, labels: Tensor, g_idx: Tensor, num_graphs: int) -> Tensor:
+        one_hot = F.one_hot(labels, num_classes=self.num_classes).float() # (N, C)
+        sums = torch.zeros(num_graphs, self.num_classes, device=labels.device)
+        sums.index_add_(0, g_idx, one_hot)  # (G, C)
+        return sums
 
     def arrange(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
         device = batch[self.planes[0]].x_count.device
         num_graphs = batch.num_graphs
-        num_planes = len(self.planes)
-        num_classes = len(self.semantic_classes)
+        P = len(self.planes)
+        C = self.num_classes
 
-        # Allocate [num_graphs, num_planes, num_classes]
-        x = torch.zeros(num_graphs, num_planes, num_classes, device=device)
-        y = torch.zeros(num_graphs, num_planes, num_classes, device=device)
+        x = torch.zeros(num_graphs, P, C, device=device)
+        y = torch.zeros(num_graphs, P, C, device=device)
 
         for j, p in enumerate(self.planes):
-            # Collect the predicted distribution for plane p, shape => [num_graphs, num_classes]
             x[:, j, :] = batch[p].x_count
 
-            # Build ground-truth distribution gather the labels for plane p
             labels = batch[p].y_semantic
-            valid_mask = (labels != -1)
-            labels = labels[valid_mask]
+            valid = (labels != -1)
+            if valid.any():
+                g_idx = batch[p].batch[valid]
+                sums  = self._counts_per_graph(labels[valid], g_idx, num_graphs) # (G, C)
 
-            # which graph each node belongs to
-            g_idx = batch[p].batch[valid_mask]
+                # Convert to fractions
+                totals = sums.sum(dim=1, keepdim=True) # (G,1)
+                frac = torch.where(
+                    totals > 0,
+                    sums / torch.clamp_min(totals, 1.0),
+                    torch.zeros_like(sums)
+                )
 
-            # One-hot encode the valid labels => shape [num_valid_nodes, num_classes]
-            one_hot = F.one_hot(labels, num_classes=num_classes).float()
+                # optional label smoothing (only on rows with data)
+                eps = self.label_smoothing
+                if eps > 0:
+                    frac = (1 - eps) * frac + eps / C
 
-            # Accumulate the sums of one-hot vectors per graph using index_add_, sums => shape [num_graphs, num_classes]
-            sums = torch.zeros(num_graphs, num_classes, device=device)
-            sums.index_add_(0, g_idx, one_hot)
+                y[:, j, :] = frac
+            else:
+                y[:, j, :] = 0.0
 
-            # Convert sums to fractions-of-total
-            row_sums = sums.sum(dim=1, keepdim=True)
-            row_sums = torch.where(row_sums == 0, torch.tensor(1., device=device),
-                                   row_sums)  # avoid division by zero if no valid node
-            frac = sums / row_sums
-
-            y[:, j, :] = frac
-
-        # Finally, flatten the last two dims => shape [num_graphs, num_planes * num_classes]
-        x = x.flatten(start_dim=1)
-        y = y.flatten(start_dim=1)
-
+        # Flatten planes and classes
+        x = x.flatten(start_dim=1)  # (G, P*C)
+        y = y.flatten(start_dim=1)  # (G, P*C)
         return x, y
 
     def metrics(self, x: Tensor, y: Tensor, stage: str) -> dict[str, Any]:
