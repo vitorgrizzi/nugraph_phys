@@ -9,6 +9,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from pytorch_lightning import LightningModule
 from torch_geometric.data import Batch, HeteroData
 from torch_geometric.utils import unbatch
+import torch.nn.functional as F
 from .encoder import Encoder
 from .plane import PlaneNet
 from .nexus import NexusNet
@@ -47,7 +48,7 @@ class NuGraph2(LightningModule):
                  michelenergy_reg: bool = False,
                  michelbinary_head: bool = False,
                  reg_type: str = 'cutoff',
-                 michel_reg_cte: float = 1e-3,
+                 michel_reg_cte: float = 2e-3,
                  lr: float = 0.0005):
         super().__init__()
 
@@ -252,139 +253,48 @@ class NuGraph2(LightningModule):
         # use `edep`, we can use the regularization with the integral directly since they are related by a constant.
         if self.michelenergy_reg:
             device = batch[self.planes[0]].x_semantic.device
-            michel_reg_loss = 0.0
+            N = batch.num_graphs
 
             # Hyperparameters
-            edep_lim_high = 160
-            edep_lim_low = 1
-            pdf_amp = 10
+            edep_scale = 0.00580717  # integral -> MeV
+            edep_lim_high = 83.0  # MeV cutoff
+            use_low_floor = True  # set True if you also want a low-side floor
+            edep_lim_low = 4.0  # MeV
+            high_divisor = 15.0  #
+            low_divisor = 5.0
 
-            # edep_michel_total[i] = total predicted Michel energy for event i
-            edep_michel_total = torch.zeros(batch.num_graphs, device=device, dtype=torch.float)
+            # Per-event predicted Michel energy
+            edep_total = torch.zeros(N, device=device)
 
             for p in self.planes:
-                # Argmax over semantic classes to identify Michel hits
-                y_pred = torch.argmax(batch[p].x_semantic, dim=1)
-                michel_mask = (y_pred == self.michel_id)
+                p_michel = batch[p].x_semantic[:, self.michel_id]  # (nodes,)
+                integrals = batch[p].x_raw[:, 2].to(dtype=p_michel.dtype)  # (nodes,)
 
-                # Extract integrals for michel hits (3rd feature in x_raw)
-                integrals = batch[p].x_raw[:, 2]
+                weights = p_michel * integrals  # (nodes,)
+                per_evt = torch.zeros(N, device=device, dtype=weights.dtype)
+                per_evt.index_add_(0, batch[p].batch, weights)  # sum by event
 
-                # Sum integrals per graph ID using torch.bincount
-                #   batch[p].batch[node_i] = ID of the graph/event that node_i belongs to
-                #   michel_mask filters to only those node_i that are predicted as Michel
-                plane_edep = torch.bincount(
-                    batch[p].batch[michel_mask],  # indices
-                    weights=integrals[michel_mask],  # weights to sum
-                    minlength=batch.num_graphs  # ensures at least one bin per event
-                )
+                edep_total += per_evt
 
-                # Accumulate across planes
-                edep_michel_total += plane_edep * 0.00580717
+            # Convert to energy
+            edep_total = edep_total * edep_scale  # (N,)
 
-            # Applying the loss to each event
-            for edep_michel in edep_michel_total:
-                if edep_michel > 0:
-                    if self.reg_type == 'cutoff':
-                        if edep_michel < edep_lim_low:
-                            michel_reg_loss += self.michel_reg_cte * (edep_lim_low - edep_michel) / 10.0
-                        elif edep_michel > edep_lim_high:
-                            michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_high) / 15.0
+            # Over-high penalty
+            tau = 2.0  # MeV smoothing width
+            over_soft = F.softplus((edep_total - edep_lim_high) / tau) * tau
+            loss_over = (over_soft / high_divisor).sum()
 
+            # Optional low-side penalty
+            if use_low_floor:
+                tau_low = 1.0  # MeV smoothing width
+                under_soft = F.softplus((edep_lim_low - edep_total) / tau_low) * tau_low
+                loss_under = (under_soft / low_divisor).sum()
+            else:
+                loss_under = edep_total.new_zeros(())
 
-                    elif self.reg_type == 'landau' and edep_michel > 8.5:
-                        pdf_value = MichelDistribution.get_pdf_value(edep_michel.item(), 'landau')
-                        michel_reg_loss += self.michel_reg_cte * (1 - pdf_amp * pdf_value)
-
-                    elif self.reg_type == 'data':
-                        pdf_value = MichelDistribution.get_pdf_value(edep_michel.item(), 'data')
-                        michel_reg_loss += self.michel_reg_cte * (1 - pdf_amp * pdf_value)
-            total_loss += michel_reg_loss
-
-            # if self.michelenergy_reg:
-            #     michel_reg_loss = 0.0
-
-            #     # Hyperparameters
-            #     edep_lim_high = 160
-            #     edep_lim_low  = 1
-            #     pdf_amp       = 10
-
-            #     # For each event/graph in the batch, accumulate the predicted Michel energy.
-            #     for i in range(batch.num_graphs):
-            #         edep_michel = 0.0
-            #         for p in self.planes:
-            #             # Create a boolean mask for nodes in graph i for plane p.
-            #             graph_mask = (batch[p].batch == i)
-            #             if graph_mask.sum() == 0:
-            #                 continue  # No nodes in this event for the current plane
-
-            #             # Compute the predicted labels (argmax) for the nodes in this graph.
-            #             y_pred = torch.argmax(batch[p].x_semantic[graph_mask], dim=1)
-
-            #             # Create a mask for nodes predicted as Michel hits.
-            #             michel_mask = (y_pred == self.michel_id)
-
-            #             # If there is at least one Michel hit, sum the 'integral' feature (third column)
-            #             if michel_mask.any():
-            #                 # Note: batch[p].x_raw[graph_mask] selects the nodes in this graph.
-            #                 sumintegral_michel = torch.sum(batch[p].x_raw[graph_mask][michel_mask, 2])
-            #                 # Convert the integral to deposited energy and accumulate.
-            #                 edep_michel += sumintegral_michel * 0.00580717
-
-            #         # Apply the penalty logic for the event if any Michel energy was predicted.
-            #         if edep_michel > 0:
-            #             if self.reg_type == 'cutoff':
-            #                 if edep_michel < edep_lim_low:
-            #                     michel_reg_loss += self.michel_reg_cte * (edep_lim_low - edep_michel) / 10.0
-            #                 elif edep_michel > edep_lim_high:
-            #                     michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_high) / 15.0
-            #             elif self.reg_type == 'landau' and edep_michel > 8.5:
-            #                 pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='landau')
-            #                 michel_reg_loss += self.michel_reg_cte * (1 - pdf_value) * pdf_amp
-            #             elif self.reg_type == 'data':
-            #                 pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='data')
-            #                 michel_reg_loss += self.michel_reg_cte * (1 - pdf_value) * pdf_amp
-            #     total_loss += michel_reg_loss
-
-            # for graph in batch.to_data_list():
-
-            #     edep_michel = 0.0
-            #     for p in self.planes:
-            #         # Finding the predicted labels
-            #         y_pred = torch.argmax(graph[p].x_semantic, dim=1)
-
-            #         # Finding the indices of the entries that correspond to michel electrons
-            #         michel_idxs = torch.nonzero(y_pred == self.michel_id)
-
-            #         # If we predict a michel electron then find its deposited energy
-            #         if self.michel_id in y_pred:
-            #             # Getting the `integral` feature of the nodes that the semantic decoder labeled as michel
-            #             sumintegral_michel = torch.sum(graph[p].x_raw[michel_idxs, 2])  # Integral is the third feature
-
-            #             # Finding the deposited energy from that `integral`
-            #             edep_michel += sumintegral_michel * 0.00580717
-
-            #     if edep_michel > 0:
-            #         # Adding a penalty to the loss based on the predicted deposited energy and its expected value
-            #         if self.reg_type == 'cutoff':  # hard cutoff for very high deposited energies
-            #             # if edep_michel > edep_lim_high:
-            #             #     michel_reg_loss += self.michel_reg_cte * (edep_michel - edep_lim_high) / 15
-            #             if edep_michel < edep_lim_low:
-            #                 michel_reg_loss += self.michel_reg_cte * (edep_lim_low - edep_michel) / 10
-
-            #         elif self.reg_type == 'landau' and edep_michel > 8.5:  # single peak distribution
-            #             pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='landau')
-            #             michel_reg_loss += self.michel_reg_cte * (1 - pdf_value) * pdf_amp
-
-            #         elif self.reg_type == 'data':  # purely from data, double peaked distribution
-            #             pdf_value = MichelDistribution.get_pdf_value(edep_michel, distribution='data')
-            #             michel_reg_loss += self.michel_reg_cte * (1 - pdf_value) * pdf_amp
-
-            #     # # Extracting the true deposited energies
-            #     # true_mich_idxs = torch.nonzero(graph[p].y_semantic == self.michel_id)
-            #     # int += torch.sum(graph[p].x_raw[true_mich_idxs, 2])
-            #     # if int != 0: print(f'Edep: {int * 0.00580717}')
-            # total_loss += michel_reg_loss
+            # Combine
+            michel_reg_loss = self.michel_reg_cte * (loss_over + loss_under)
+            total_loss = total_loss + michel_reg_loss
 
         return total_loss, total_metrics
 
